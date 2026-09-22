@@ -45,10 +45,18 @@ export type Table = {
   comment?: string;
 };
 
+export type VirtualTable = {
+  name: string;
+  module: 'fts5';
+  columns: string[];
+  options?: string[];
+};
+
 export type DatabaseSchema = {
   name: string;
   version?: number;
   tables: Table[];
+  virtualTables?: VirtualTable[];
 };
 
 export function isDatabaseSchema(v: any): v is DatabaseSchema {
@@ -183,7 +191,13 @@ export function normalizeSchema(dsl: SchemaDsl): DatabaseSchema {
 
     tables.push({ name: tname, columns: cols, indexes: indexes.length > 0 ? indexes : undefined });
   }
-  return { name: dsl.name, version: dsl.version, tables };
+  const virtualTables = Object.entries(dsl.virtualTables ?? {}).map(([name, definition]) => ({
+    name,
+    module: definition.module,
+    columns: [...definition.columns],
+    options: definition.options ? [...definition.options] : undefined,
+  }));
+  return { name: dsl.name, version: dsl.version, tables, virtualTables: virtualTables.length ? virtualTables : undefined };
 }
 
 /**

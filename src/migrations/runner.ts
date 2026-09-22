@@ -74,12 +74,15 @@ async function ensureMigrationsTable(execute: SqlExecutor): Promise<void> {
 
 function hashSchema(schema: DatabaseSchema): string {
   // Deterministic hash of the schema structure for change detection
-  const str = JSON.stringify(schema.tables.map(t => ({
-    name: t.name,
-    columns: t.columns.map(c => ({ name: c.name, type: c.type, notNull: c.notNull, primaryKey: c.primaryKey, unique: c.unique, default: c.default, references: c.references, enum: c.enum })),
-    indexes: t.indexes,
-    checks: t.checks,
-  })));
+  const str = JSON.stringify({
+    tables: schema.tables.map(t => ({
+      name: t.name,
+      columns: t.columns.map(c => ({ name: c.name, type: c.type, notNull: c.notNull, primaryKey: c.primaryKey, unique: c.unique, default: c.default, references: c.references, enum: c.enum })),
+      indexes: t.indexes,
+      checks: t.checks,
+    })),
+    virtualTables: schema.virtualTables ?? [],
+  });
   // Simple FNV-1a hash â€” no crypto needed, just change detection
   let hash = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
@@ -141,14 +144,18 @@ function parseIntrospectedCol(c: any): any {
 async function introspectSchema(
   execute: SqlExecutor,
   schemaName: string,
-  client?: FullDbClient
+  client?: FullDbClient,
+  targetVirtualTableNames: string[] = []
 ): Promise<DatabaseSchema | null> {
   const tablesResult = await execute(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name != ?",
     [MIGRATIONS_TABLE]
   );
   if (!tablesResult || tablesResult.success === false) return null;
-  const tableNames: string[] = ((tablesResult as any).data ?? (tablesResult as any).results ?? []).map((r: any) => r.name);
+  const virtualPrefixes = targetVirtualTableNames.map((name) => `${name}_`);
+  const tableNames: string[] = ((tablesResult as any).data ?? (tablesResult as any).results ?? [])
+    .map((r: any) => String(r.name))
+    .filter((name: string) => !targetVirtualTableNames.includes(name) && !virtualPrefixes.some((prefix) => name.startsWith(prefix)));
   if (tableNames.length === 0) return null;
 
   if (client?.batch && client.prepare) {
@@ -269,7 +276,7 @@ export async function runMigrations(options: MigrateOptions): Promise<MigrateRes
   if (!latest) {
     sql = buildInitialSql(targetSchema);
   } else {
-    const currentSchema = await introspectSchema(execute, schemaName, client);
+    const currentSchema = await introspectSchema(execute, schemaName, client, (targetSchema.virtualTables ?? []).map((table) => table.name));
     if (currentSchema) {
       const diff = diffSchemas(currentSchema, targetSchema);
       sql = diff.statements.join('\n');

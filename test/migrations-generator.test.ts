@@ -111,4 +111,21 @@ describe('migration SQL generation', () => {
       'Table "old table" removed in target schema; dropping tables is not performed automatically.',
     ]);
   });
+
+  it('creates FTS5 virtual tables from the schema DSL shape', () => {
+    const schema: DatabaseSchema = {
+      name: 'knowledge',
+      tables: [],
+      virtualTables: [{
+        name: 'knowledge_chunks_fts',
+        module: 'fts5',
+        columns: ['chunk_id', 'title', 'heading', 'content'],
+        options: ["tokenize='porter unicode61'"],
+      }],
+    };
+
+    expect(buildInitialSql(schema)).toContain(
+      'CREATE VIRTUAL TABLE IF NOT EXISTS "knowledge_chunks_fts" USING fts5("chunk_id", "title", "heading", "content", tokenize=\'porter unicode61\')'
+    );
+  });
 });

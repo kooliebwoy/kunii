@@ -4,6 +4,14 @@
   "description": "Lightweight D1/SQLite ORM for Cloudflare Workers",
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kooliebwoy/kunii.git"
+  },
+  "homepage": "https://github.com/kooliebwoy/kunii#readme",
+  "bugs": {
+    "url": "https://github.com/kooliebwoy/kunii/issues"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [

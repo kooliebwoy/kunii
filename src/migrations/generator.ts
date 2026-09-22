@@ -2,7 +2,7 @@
  * SQL Generation and Schema Diffing
  */
 
-import type { Column, DatabaseSchema, Index, Table } from '../schema.js';
+import type { Column, DatabaseSchema, Index, Table, VirtualTable } from '../schema.js';
 
 // === SQL Generation ===
 
@@ -70,26 +70,35 @@ function createIndexSql(table: Table, idx: Index): string {
   return `CREATE ${uniq}INDEX IF NOT EXISTS ${q(idx.name)} ON ${q(table.name)}(${cols})`;
 }
 
-export function schemaToSqlStatements(schema: DatabaseSchema): { tables: string[]; indexes: string[] } {
+function createVirtualTableSql(table: VirtualTable): string {
+  if (table.module !== 'fts5') throw new Error(`Unsupported SQLite virtual table module: ${table.module}`);
+  if (table.columns.length === 0) throw new Error(`Virtual table ${table.name} needs at least one column`);
+  const args = [...table.columns.map(q), ...(table.options ?? [])].join(', ');
+  return `CREATE VIRTUAL TABLE IF NOT EXISTS ${q(table.name)} USING fts5(${args})`;
+}
+
+export function schemaToSqlStatements(schema: DatabaseSchema): { tables: string[]; indexes: string[]; virtualTables: string[] } {
   const tables: string[] = [];
   const indexes: string[] = [];
+  const virtualTables = (schema.virtualTables ?? []).map(createVirtualTableSql);
   for (const t of schema.tables) {
     tables.push(createTableSql(t));
     if (t.indexes) {
       for (const idx of t.indexes) indexes.push(createIndexSql(t, idx));
     }
   }
-  return { tables, indexes };
+  return { tables, indexes, virtualTables };
 }
 
 export function buildInitialSql(schema: DatabaseSchema): string {
-  const { tables, indexes } = schemaToSqlStatements(schema);
-  return [...tables, ...indexes].map((s) => `${s};`).join('\n\n');
+  const { tables, indexes, virtualTables } = schemaToSqlStatements(schema);
+  return [...tables, ...indexes, ...virtualTables].map((s) => `${s};`).join('\n\n');
 }
 
 export function renderColumnDef(col: Column): string { return columnDef(col); }
 export function renderCreateTableSql(t: Table): string { return createTableSql(t); }
 export function renderCreateIndexSql(table: Table, idx: Index): string { return createIndexSql(table, idx); }
+export function renderCreateVirtualTableSql(table: VirtualTable): string { return createVirtualTableSql(table); }
 
 // === Schema Diffing ===
 
@@ -157,6 +166,10 @@ export function diffSchemas(from: DatabaseSchema, to: DatabaseSchema): DiffResul
 
   const fromTables = byName(from.tables);
   const toTables = byName(to.tables);
+
+  for (const table of to.virtualTables ?? []) {
+    statements.push(renderCreateVirtualTableSql(table) + ';');
+  }
 
   for (const [tname, t] of toTables) {
     if (!fromTables.has(tname)) {

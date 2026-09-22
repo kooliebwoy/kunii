@@ -24,7 +24,7 @@ export type {
 
 // Schema
 export { normalizeSchema, ensureNormalizedSchema } from './schema.js';
-export type { DatabaseSchema, Column, Index, SqlDefault, Reference } from './schema.js';
+export type { DatabaseSchema, Column, Index, SqlDefault, Reference, VirtualTable } from './schema.js';
 // `Table` from schema.js is a column-list table definition. Renamed on
 // re-export to avoid clashing with the query-side `Table<Row>` interface
 // from types.js, which is the user-facing API surface and gets the bare
@@ -35,13 +35,13 @@ export { isDatabaseSchema } from './schema.js';
 // Types
 export type {
   Primitive, Where, WhereValue, WhereOperators, OrderBy, OrderItem, FindManyOptions,
-  QueryResult, SqlExecutor, SqlCondition, FullDbClient, IncludeSpec, IncludeConfig,
+  QueryResult, SqlExecutor, SqlCondition, FullDbClient, OrmClient, IncludeSpec, IncludeConfig,
   Table, UpsertOptions, SelectSpec, SelectColumn,
   // Deprecated aliases — both resolve to Table.
   TableApi, TableQuery,
   // Batch.
   BatchTable, BatchTransaction, BatchCallback, BatchResult,
-  ColumnDefString, TableDsl, MixinsDsl, IndexDsl, TableIndexesDsl, SchemaDsl,
+  ColumnDefString, TableDsl, MixinsDsl, IndexDsl, TableIndexesDsl, Fts5TableDsl, VirtualTableDsl, SchemaDsl,
   OrmAdapterConfig, ExecutorAdapterConfig,
 } from './types.js';
 

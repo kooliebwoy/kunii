@@ -310,12 +310,22 @@ export type IndexDsl = {
 
 export type TableIndexesDsl = Record<string, IndexDsl>;
 
+export type Fts5TableDsl = {
+  module: 'fts5';
+  columns: string[];
+  /** Additional trusted FTS5 arguments, for example `tokenize='porter unicode61'`. */
+  options?: string[];
+};
+
+export type VirtualTableDsl = Fts5TableDsl;
+
 export type SchemaDsl = {
   name: string;
   version: number;
   mixins?: MixinsDsl;
   tables: Record<string, TableDsl>;
   indexes?: Record<string, TableIndexesDsl>;
+  virtualTables?: Record<string, VirtualTableDsl>;
 };
 
 // ── Adapter Config (advanced — custom executors only) ────────
