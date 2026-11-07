@@ -6,7 +6,7 @@ import type { Column, DatabaseSchema, Index, Table, VirtualTable } from '../sche
 
 // === SQL Generation ===
 
-function q(str: string): string {
+export function q(str: string): string {
   return `"${str.replace(/"/g, '""')}"`;
 }
 
@@ -64,10 +64,11 @@ function createTableSql(t: Table): string {
   return `CREATE TABLE IF NOT EXISTS ${q(t.name)} (\n${lines.join(',\n')}\n)`;
 }
 
-function createIndexSql(table: Table, idx: Index): string {
+function createIndexSql(table: Table, idx: Index, ifNotExists = true): string {
   const cols = idx.columns.map((c) => q(c)).join(', ');
   const uniq = idx.unique ? 'UNIQUE ' : '';
-  return `CREATE ${uniq}INDEX IF NOT EXISTS ${q(idx.name)} ON ${q(table.name)}(${cols})`;
+  const guard = ifNotExists ? 'IF NOT EXISTS ' : '';
+  return `CREATE ${uniq}INDEX ${guard}${q(idx.name)} ON ${q(table.name)}(${cols})`;
 }
 
 function createVirtualTableSql(table: VirtualTable): string {
@@ -105,12 +106,18 @@ export function renderCreateVirtualTableSql(table: VirtualTable): string { retur
 export type DiffResult = {
   statements: string[];
   warnings: string[];
+  /** Existing definitions that need an explicit migration. */
+  unresolved?: boolean;
 };
 
 function byName<T extends { name: string }>(arr: T[]): Map<string, T> {
   const m = new Map<T['name'], T>();
   for (const x of arr) m.set(x.name, x);
   return m;
+}
+
+export function sameIndexDefinition(a: Index, b: Index): boolean {
+  return !!a.unique === !!b.unique && JSON.stringify(a.columns) === JSON.stringify(b.columns);
 }
 
 function safeAddColumnSql(table: Table, col: Column): { statements: string[]; warning?: string } {
@@ -134,7 +141,7 @@ function safeAddColumnSql(table: Table, col: Column): { statements: string[]; wa
         const escaped = String(v).replace(/'/g, "''");
         parts.push(`DEFAULT '${escaped}'`);
       }
-      canKeepNotNull = true;
+      canKeepNotNull = v !== null;
     }
   }
 
@@ -160,22 +167,47 @@ function safeAddColumnSql(table: Table, col: Column): { statements: string[]; wa
   return { statements, warning };
 }
 
-export function diffSchemas(from: DatabaseSchema, to: DatabaseSchema): DiffResult {
+export function addedColumnDefinition(column: Column): Column {
+  const constant = column.default?.kind === 'value' ? column.default : undefined;
+  return {
+    name: column.name,
+    type: column.type,
+    default: constant,
+    notNull: !!(column.notNull && constant && constant.value !== null),
+  };
+}
+
+export function diffSchemas(
+  from: DatabaseSchema,
+  to: DatabaseSchema,
+  { additiveOnly = false, canReplaceIndex }: {
+    additiveOnly?: boolean;
+    canReplaceIndex?: (table: Table, existing: Index) => boolean;
+  } = {},
+): DiffResult {
+  const indexDrops: string[] = [];
   const statements: string[] = [];
   const warnings: string[] = [];
+  let unresolved = false;
 
   const fromTables = byName(from.tables);
   const toTables = byName(to.tables);
 
+  const fromVirtual = byName(from.virtualTables ?? []);
   for (const table of to.virtualTables ?? []) {
-    statements.push(renderCreateVirtualTableSql(table) + ';');
+    const existing = fromVirtual.get(table.name);
+    if (!existing) statements.push(renderCreateVirtualTableSql(table) + ';');
+    else if (renderCreateVirtualTableSql(existing) !== renderCreateVirtualTableSql(table)) {
+      unresolved = true;
+      warnings.push(`Virtual table ${q(table.name)} changed; an explicit migration is required.`);
+    }
   }
 
   for (const [tname, t] of toTables) {
     if (!fromTables.has(tname)) {
       statements.push(renderCreateTableSql(t) + ';');
       if (t.indexes) {
-        for (const idx of t.indexes) statements.push(renderCreateIndexSql(t, idx) + ';');
+        for (const idx of t.indexes) statements.push(createIndexSql(t, idx, !additiveOnly) + ';');
       }
     }
   }
@@ -187,17 +219,28 @@ export function diffSchemas(from: DatabaseSchema, to: DatabaseSchema): DiffResul
     const fromCols = byName(tFrom.columns);
     const toCols = byName(tTo.columns);
     for (const col of tTo.columns) {
-      if (!fromCols.has(col.name)) {
+      const existing = fromCols.get(col.name);
+      if (!existing) {
         const { statements: addStatements, warning } = safeAddColumnSql(tTo, col);
         for (const statement of addStatements) statements.push(statement + ';');
-        if (warning) warnings.push(warning);
+        if (warning) {
+          warnings.push(warning);
+          unresolved = true;
+        }
+      } else if (columnDef(existing) !== columnDef(col)) {
+        unresolved = true;
+        warnings.push(`Column definition changed for ${q(tname)}.${q(col.name)}; an explicit migration is required.`);
       }
     }
 
     for (const [colName, colFrom] of fromCols) {
       if (!toCols.has(colName)) {
-        statements.push(`ALTER TABLE ${q(tname)} DROP COLUMN ${q(colName)};`);
-        warnings.push(`Dropping column ${q(tname)}.${q(colName)} removes existing data.${colFrom.primaryKey ? ' Ensure a new primary key is defined.' : ''}`);
+        if (additiveOnly) {
+          warnings.push(`Column ${q(tname)}.${q(colName)} was omitted from the target schema and has been preserved.`);
+        } else {
+          statements.push(`ALTER TABLE ${q(tname)} DROP COLUMN ${q(colName)};`);
+          warnings.push(`Dropping column ${q(tname)}.${q(colName)} removes existing data.${colFrom.primaryKey ? ' Ensure a new primary key is defined.' : ''}`);
+        }
       }
     }
 
@@ -208,21 +251,29 @@ export function diffSchemas(from: DatabaseSchema, to: DatabaseSchema): DiffResul
 
     for (const [iname, idx] of toIdx) {
       const existing = fromIdx.get(iname);
-      const same = existing && existing.unique === idx.unique &&
-        JSON.stringify(existing.columns) === JSON.stringify(idx.columns);
-      if (!existing || !same) {
-        statements.push(renderCreateIndexSql(tTo, idx) + ';');
+      const same = existing && sameIndexDefinition(existing, idx);
+      if (existing && !same) {
+        if (additiveOnly && !canReplaceIndex?.(tTo, existing)) {
+          unresolved = true;
+          warnings.push(`Index ${q(iname)} changed; an explicit migration is required.`);
+          continue;
+        }
+        indexDrops.push(`DROP INDEX IF EXISTS ${q(iname)};`);
+      }
+      if (!same) {
+        statements.push(createIndexSql(tTo, idx, !additiveOnly) + ';');
       }
     }
 
     for (const [iname, idxFrom] of fromIdx) {
       if (!toIdx.has(iname)) {
-        statements.push(`DROP INDEX IF EXISTS ${q(iname)};`);
-        warnings.push(`Index ${q(iname)} on ${q(tname)} referencing columns (${idxFrom.columns.map(q).join(', ')}) removed.`);
+        if (!additiveOnly) indexDrops.push(`DROP INDEX IF EXISTS ${q(iname)};`);
+        warnings.push(`Index ${q(iname)} on ${q(tname)} referencing columns (${idxFrom.columns.map(q).join(', ')}) ${additiveOnly ? 'preserved' : 'removed'}.`);
       }
     }
 
-    if (tTo.checks && JSON.stringify(tTo.checks) !== JSON.stringify(tFrom.checks || [])) {
+    if (JSON.stringify(tTo.checks ?? []) !== JSON.stringify(tFrom.checks ?? [])) {
+      unresolved = true;
       warnings.push(`CHECK constraints changed for table ${q(tname)}; full table rebuild required.`);
     }
   }
@@ -233,7 +284,7 @@ export function diffSchemas(from: DatabaseSchema, to: DatabaseSchema): DiffResul
     }
   }
 
-  return { statements, warnings };
+  return { statements: [...indexDrops, ...statements], warnings, ...(unresolved ? { unresolved } : {}) };
 }
 
 export function buildDiffSql(from: DatabaseSchema, to: DatabaseSchema): { sql: string; warnings: string[] } {

@@ -15,8 +15,8 @@
  */
 
 import { DurableObject } from 'cloudflare:workers';
-import { autoMigrate, kunii } from '../../src/index.js';
-import { runMigrations } from '../../src/migrations/index.js';
+import { autoMigrate, initKuniiDO, kunii } from '../../src/index.js';
+import { runDurableObjectMigrations } from '../../src/migrations/index.js';
 import type { SchemaDsl } from '../../src/types.js';
 
 export const testSchema: SchemaDsl = {
@@ -132,16 +132,24 @@ export class TestDO extends DurableObject<Env> {
   }
 
   async migrateSchema(schema: SchemaDsl): Promise<any> {
-    return await runMigrations({
-      execute: async (sql, params) => {
-        const cursor = params?.length
-          ? this.ctx.storage.sql.exec(sql, ...params)
-          : this.ctx.storage.sql.exec(sql);
-        const rows = cursor?.toArray?.() ?? [];
-        return { success: true, data: rows, results: rows };
-      },
-      schema,
-    });
+    return runDurableObjectMigrations(this.ctx.storage, schema);
+  }
+
+  initializeSchema(schema: SchemaDsl) {
+    try {
+      initKuniiDO(this.ctx.storage, schema);
+      return { success: true, error: '' };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  }
+
+  execChecked(sql: string) {
+    try {
+      return { rows: this.ctx.storage.sql.exec(sql).toArray(), error: '' };
+    } catch (error) {
+      return { rows: [], error: (error as Error).message };
+    }
   }
 
   async exec(sql: string): Promise<any[]> {

@@ -6,7 +6,7 @@
  */
 
 import { autoMigrate, kunii } from './orm.js';
-import { runMigrations } from './migrations/runner.js';
+import { runMigrations, type MigrateResult } from './migrations/runner.js';
 import type { DatabaseSchema } from './schema.js';
 import type { FullDbClient, OrmClient, SchemaDsl, SqlExecutor } from './types.js';
 
@@ -26,8 +26,8 @@ export interface KuniiRuntime<Schemas extends KuniiSchemas> {
   readonly schemas: Schemas;
   /** Run migrations every time. `runMigrations` still skips unchanged schemas. */
   migrate(env: KuniiEnv): Promise<void>;
-  /** Run migrations once per isolate for each binding object + binding name. */
-  migrateOnce(env: KuniiEnv): Promise<void>;
+  /** Run migrations once per isolate and return the result for each binding. */
+  migrateOnce(env: KuniiEnv): Promise<Record<string, MigrateResult>>;
   /** Create one ORM client for a binding. This does not run DDL. */
   db<Name extends keyof Schemas & string>(env: KuniiEnv, bindingName: Name): OrmClient;
   /** Create ORM clients for every configured binding. This does not run DDL. */
@@ -49,7 +49,7 @@ export type CloudflareOrmInitOptions = KuniiInitOptions;
 /** @deprecated Use `KuniiRuntime` instead. */
 export type CloudflareOrmRuntime<Schemas extends KuniiSchemas> = KuniiRuntime<Schemas>;
 
-type MigrationCache = WeakMap<object, Map<string, Promise<void>>>;
+type MigrationCache = WeakMap<object, Map<string, Promise<MigrateResult>>>;
 
 function makeLabel(label?: string): string {
   return label ? `kunii/${label}` : 'kunii';
@@ -103,12 +103,12 @@ function d1Executor(database: any): { execute: SqlExecutor; client: FullDbClient
 async function migrateBinding(
   binding: any,
   schema: KuniiSchema,
-): Promise<void> {
+): Promise<MigrateResult> {
   const { execute, client } = d1Executor(binding);
-  await runMigrations({ execute, schema, client });
+  return runMigrations({ execute, schema, client });
 }
 
-function cacheForBinding(cache: MigrationCache, binding: object): Map<string, Promise<void>> {
+function cacheForBinding(cache: MigrationCache, binding: object): Map<string, Promise<MigrateResult>> {
   let byName = cache.get(binding);
   if (!byName) {
     byName = new Map();
@@ -131,7 +131,8 @@ export function initKuniiORM<Schemas extends KuniiSchemas>(
     }
   };
 
-  const migrateOnce = async (env: KuniiEnv): Promise<void> => {
+  const migrateOnce = async (env: KuniiEnv): Promise<Record<string, MigrateResult>> => {
+    const results = new Map<string, MigrateResult>();
     for (const bindingName of bindingNames) {
       const binding = getD1Binding(env, bindingName, options.label);
       const byName = cacheForBinding(migrationCache, binding);
@@ -143,8 +144,9 @@ export function initKuniiORM<Schemas extends KuniiSchemas>(
         });
         byName.set(bindingName, migration);
       }
-      await migration;
+      results.set(bindingName, await migration);
     }
+    return Object.fromEntries(results);
   };
 
   const db = <Name extends keyof Schemas & string>(

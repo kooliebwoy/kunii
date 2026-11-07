@@ -21,6 +21,8 @@ export type Reference = {
 
 export type Column = {
   name: string;
+  /** Previous physical name. Keep until supported databases have upgraded. */
+  renameFrom?: string;
   type: 'text' | 'integer' | 'real' | 'blob' | 'json';
   mode?: 'boolean' | 'timestamp_ms';
   notNull?: boolean;
@@ -81,7 +83,7 @@ function parseDefault(tokens: string[], i: number): { def?: Column['default']; n
   // designator, which V8 interprets as *local* time.
   if (/^now$/i.test(t)) return { def: { kind: 'raw', sql: "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))" }, next: i + 2 };
   if (/^null$/i.test(t)) return { def: { kind: 'value', value: null }, next: i + 2 };
-  if (/^\(.*\)$/.test(t)) return { def: { kind: 'raw', sql: t }, next: i + 2 };
+  if (t.startsWith('(') && t.endsWith(')')) return { def: { kind: 'raw', sql: t }, next: i + 2 };
   if (/^\d+$/.test(t)) return { def: { kind: 'value', value: Number(t) }, next: i + 2 };
   if (/^\d+\.\d+$/.test(t)) return { def: { kind: 'value', value: Number(t) }, next: i + 2 };
   return { def: { kind: 'value', value: t.replace(/^"|"$/g, '') }, next: i + 2 };
@@ -92,17 +94,44 @@ function parseReferences(tokens: string[], i: number): { ref?: Column['reference
   const target = tokens[i + 1];
   if (!target || !target.includes('.')) return { next: i + 1 };
   const [table, column] = target.split('.', 2);
-  let onDelete: Column['references'] extends { onDelete: infer OD } ? OD : any = undefined;
-  const od = tokens[i + 2];
-  if (od && /^(cascade|restrict|set|null|no\s?action|set\s?default)$/i.test(od)) {
-    onDelete = od.toLowerCase() as any;
-    return { ref: { table, column, onDelete }, next: i + 3 };
+  const action = tokens[i + 2]?.toLowerCase();
+  if (action === 'cascade' || action === 'restrict') {
+    return { ref: { table, column, onDelete: action }, next: i + 3 };
+  }
+  const compound = `${action} ${tokens[i + 3]?.toLowerCase()}`;
+  if (compound === 'set null' || compound === 'set default' || compound === 'no action') {
+    return { ref: { table, column, onDelete: compound }, next: i + 4 };
   }
   return { ref: { table, column }, next: i + 2 };
 }
 
+function tokenizeColumnDef(def: string): string[] {
+  const tokens: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quote: string | undefined;
+  for (let i = 0; i < def.length; i++) {
+    const char = def[i];
+    if (quote) {
+      if (char === quote && def[i + 1] === quote) i++;
+      else if (char === quote) quote = undefined;
+    } else if (char === '"' || (char === "'" && (depth > 0 || i === start))) {
+      quote = char;
+    } else if (char === '(') {
+      depth++;
+    } else if (char === ')' && depth > 0) {
+      depth--;
+    } else if (depth === 0 && /\s/.test(char)) {
+      if (i > start) tokens.push(def.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start < def.length) tokens.push(def.slice(start));
+  return tokens;
+}
+
 function parseColumnDef(name: string, def: string): Column {
-  const tokens = def.trim().split(/\s+/);
+  const tokens = tokenizeColumnDef(def);
   let i = 0;
   let typeTok = tokens[i++]?.toLowerCase() || 'text';
   const col: Column = { name, type: 'text' } as Column;
@@ -121,6 +150,13 @@ function parseColumnDef(name: string, def: string): Column {
 
   while (i < tokens.length) {
     const tok = tokens[i].toLowerCase();
+    if (tok === 'renamefrom') {
+      const source = tokens[i + 1];
+      if (!source) throw new Error(`Missing renameFrom source for ${name}`);
+      col.renameFrom = source.replace(/^"|"$/g, '');
+      i += 2;
+      continue;
+    }
     if (tok === 'primary') {
       if (tokens[i + 1]?.toLowerCase() === 'key') { col.primaryKey = true; i += 2; continue; }
     }

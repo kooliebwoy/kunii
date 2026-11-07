@@ -4,6 +4,28 @@ import type { DatabaseSchema } from '../src/schema.js';
 import { buildInitialSql, diffSchemas } from '../src/migrations/generator.js';
 
 describe('migration SQL generation', () => {
+  it('rebuilds changed indexes offline and treats omitted unique as false', () => {
+    const from: DatabaseSchema = {
+      name: 'app',
+      tables: [{
+        name: 'accounts',
+        columns: [{ name: 'id', type: 'integer' }, { name: 'email', type: 'text' }],
+        indexes: [{ name: 'lookup', columns: ['id'] }, { name: 'unchanged', columns: ['email'] }],
+      }],
+    };
+    const to: DatabaseSchema = {
+      ...from,
+      tables: [{
+        ...from.tables[0],
+        indexes: [{ name: 'lookup', columns: ['email'], unique: true }, { name: 'unchanged', columns: ['email'], unique: false }],
+      }],
+    };
+    expect(diffSchemas(from, to).statements).toEqual([
+      'DROP INDEX IF EXISTS "lookup";',
+      'CREATE UNIQUE INDEX IF NOT EXISTS "lookup" ON "accounts"("email");',
+    ]);
+  });
+
   it('quotes identifiers in initial table and index creation', () => {
     const schema: DatabaseSchema = {
       name: 'app',

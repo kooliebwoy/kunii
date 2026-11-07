@@ -108,7 +108,7 @@ export class OrgDO extends DurableObject {
 }
 ```
 
-`initKuniiDO(ctx.storage, schema)` runs `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE ADD COLUMN` migrations synchronously, attaches `transactionSync` for atomic `db.batch()` calls, and returns a schema-aware `kunii` client.
+`initKuniiDO(ctx.storage, schema)` runs the same versioned migration engine as D1 synchronously, using `transactionSync` for atomic migrations. It supports the same rename hints, verified rebuilds, index updates, rollback protection, and pending-change rules. It also attaches `transactionSync` for atomic `db.batch()` calls and returns a schema-aware `kunii` client. Pass `ctx.storage` to supply transaction support. Bare `ctx.storage.sql` without an attached transaction function retains the executor-only additive fallback.
 
 ---
 
@@ -417,6 +417,10 @@ const user = await db.users.where({ id: 1 }).first();
 
 When using `initKuniiORM` (or framework adapters), Kunii automatically tracks and applies schema changes at runtime in a `_kuratchi_migrations` table.
 
+The D1 migrator creates missing tables, columns, and indexes. It preserves columns and indexes omitted from the target schema, including objects created outside Kunii. A forward version can rename a column with `mobile: 'text renameFrom phone'`, or `renameFrom: 'phone'` on a normalized column. Keep the hint until supported databases have upgraded. Kunii also rebuilds fully verified tables for constraint and default changes when dependencies allow an atomic swap. See [the runtime migration specification](MIGRATIONS.md) for supported operations and dependency limits. Kunii logs migration warnings before executing the plan, and `migrateOnce(env)` returns each binding's result.
+
+Increase `schema.version` for forward deployments. Kunii skips versions older than its recorded snapshot. With a native D1 binding, a newer version can also replace an index that Kunii created and whose live definition still matches its recorded definition. D1 commits the replacement and migration history together. Legacy history is upgraded in place. Deploy this version of Kunii to every active Worker before relying on rollback protection.
+
 For custom or CI/BYO migration workflows, use `@kuratchi/kunii/migrations` directly:
 
 ```ts
@@ -435,6 +439,7 @@ const initialSql = buildInitialSql(appSchema);
 const { sql: upgradeSql, warnings } = buildDiffSql(previousSchema, appSchema);
 
 // Or run tracked runtime migrations manually
+// Pass the native binding to apply schema changes and history atomically.
 await runMigrations({
   execute: (sql, params) => env.DB.prepare(sql).bind(...(params || [])).all(),
   schema: appSchema,

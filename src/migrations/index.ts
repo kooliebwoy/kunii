@@ -8,3 +8,5 @@ export { generateInitialMigrationBundle, generateInitialMigration, ensureNormali
 export type { MigrationJournal } from './utils.js';
 export { runMigrations, hasPendingMigrations } from './runner.js';
 export type { MigrateOptions, MigrateResult } from './runner.js';
+
+export { runDurableObjectMigrations } from './durable-object.js';
