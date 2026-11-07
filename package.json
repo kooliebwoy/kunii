@@ -1,6 +1,6 @@
 {
   "name": "@kuratchi/kunii",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Lightweight D1/SQLite ORM for Cloudflare Workers",
   "license": "MIT",
   "type": "module",
@@ -17,6 +17,7 @@
   "files": [
     "dist",
     "README.md",
+    "MIGRATIONS.md",
     "LICENSE"
   ],
   "exports": {
