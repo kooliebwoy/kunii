@@ -11,8 +11,8 @@ import type {
   OrmAdapterConfig,
 } from './types.js';
 import { ensureNormalizedSchema } from './schema.js';
-import { buildInitialSql } from './migrations/generator.js';
-import type { Column, DatabaseSchema } from './schema.js';
+import { runDurableObjectMigrations } from './migrations/durable-object.js';
+import type { DatabaseSchema } from './schema.js';
 
 // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -1629,7 +1629,7 @@ function d1Executor(database: any): { execute: SqlExecutor; fullClient: FullDbCl
  *      autoMigrate(ctx.storage, schema);
  *      this.db = kunii(ctx.storage.sql, schema);
  *      ```
- *      Runs `CREATE TABLE IF NOT EXISTS` + additive `ALTER TABLE` for any
+ *      Runs the shared versioned migration engine synchronously for any
  *      newly-declared columns. Idempotent across DO restarts. Call this
  *      inside the DO constructor before any `this.db` access.
  *
@@ -1682,40 +1682,11 @@ export function autoMigrate(
 }
 
 function autoMigrateDO(storageOrSql: any, schema: any): void {
-  const normalized = ensureNormalizedSchema(schema);
-
-  // Accept either `ctx.storage` (preferred — has `.sql` AND `.transactionSync`)
-  // or `ctx.storage.sql` (the SqlStorage object only). When the parent is
-  // passed, attach `transactionSync` to the SqlStorage so `kunii` picks
-  // it up for atomic `batch()`.
-  const sql =
-    typeof storageOrSql?.sql?.exec === 'function' ? storageOrSql.sql : storageOrSql;
-  if (!sql || typeof sql.exec !== 'function') {
-    throw new Error('[kunii] autoMigrate: expected ctx.storage or ctx.storage.sql; got ' + typeof storageOrSql);
-  }
-  const transactionSync: ((cb: () => any) => any) | undefined =
-    typeof storageOrSql?.transactionSync === 'function'
-      ? (storageOrSql.transactionSync.bind(storageOrSql) as any)
-      : undefined;
-
-  // Snapshot which tables exist BEFORE running initial SQL.
-  // Tables not in this set were just created — no additive migration needed.
-  const existingTables = new Set<string>();
-  try {
-    const rows = sql.exec("SELECT name FROM sqlite_master WHERE type='table'").toArray?.() ?? [];
-    for (const r of rows) existingTables.add(String(r?.name ?? ''));
-  } catch {}
-
-  // Run CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS statements.
-  const migrationSql = buildInitialSql(normalized);
-  const statements = migrationSql.split(';').map((s: string) => s.trim()).filter(Boolean);
-  for (const stmt of statements) {
-    sql.exec(stmt);
-  }
-
-  // Only check for missing columns on tables that pre-existed.
-  // Fresh tables (just created above) are already complete.
-  applyDoAdditiveMigrations(sql, normalized, existingTables);
+  const sql = storageOrSql?.sql ?? storageOrSql;
+  const transactionSync = typeof storageOrSql?.transactionSync === 'function'
+    ? storageOrSql.transactionSync.bind(storageOrSql)
+    : undefined;
+  runDurableObjectMigrations(storageOrSql, schema);
 
   // When transactionSync is available, attach it to the SqlStorage object
   // (a benign augmentation) so `kunii` picks it up for atomic batch.
@@ -1740,8 +1711,7 @@ function autoMigrateMiddleware(
   return {
     async request(ctx: any, next: () => Promise<Response>) {
       if (migratedBindings.size < Object.keys(bindings).length) {
-        // Lazy import to avoid pulling the migrations runner into bundles
-        // that only use `autoMigrate` for DOs.
+        // Both backends use the same versioned migration engine.
         const { runMigrations } = await import('./migrations/runner.js');
         const failures: string[] = [];
         for (const [bindingName, schema] of Object.entries(bindings)) {
@@ -1841,91 +1811,6 @@ export function assertSchemaInSync(
   };
 }
 
-function quoteIdent(name: string): string {
-  return `"${String(name).replace(/"/g, '""')}"`;
-}
-
-function columnSqlType(col: Column): string {
-  switch (col.type) {
-    case 'text': return 'TEXT';
-    case 'integer': return 'INTEGER';
-    case 'real': return 'REAL';
-    case 'blob': return 'BLOB';
-    case 'json': return 'TEXT';
-    default: return 'TEXT';
-  }
-}
-
-function columnDefaultSql(col: Column): string | null {
-  if (!col.default) return null;
-  if (col.default.kind === 'raw') return `DEFAULT ${col.default.sql}`;
-  const v = col.default.value;
-  if (v === null) return 'DEFAULT NULL';
-  if (typeof v === 'number') return `DEFAULT ${v}`;
-  if (typeof v === 'boolean') return `DEFAULT ${v ? 1 : 0}`;
-  const escaped = String(v).replace(/'/g, "''");
-  return `DEFAULT '${escaped}'`;
-}
-
-function buildAddColumnSql(tableName: string, col: Column): { statements: string[]; warning?: string } {
-  const parts: string[] = [
-    `ALTER TABLE ${quoteIdent(tableName)} ADD COLUMN ${quoteIdent(col.name)} ${columnSqlType(col)}`
-  ];
-  const statements: string[] = [];
-  let warning: string | undefined;
-  const dsql = columnDefaultSql(col);
-  const hasRawDefault = col.default?.kind === 'raw';
-  if (dsql && !hasRawDefault) parts.push(dsql);
-  if (col.notNull && dsql && !hasRawDefault) {
-    parts.push('NOT NULL');
-  } else if (col.notNull) {
-    warning = `[kunii] DO migration: adding ${tableName}.${col.name} without NOT NULL because SQLite cannot add NOT NULL columns with non-constant or missing defaults.`;
-  }
-  statements.push(parts.join(' '));
-  if (col.default?.kind === 'raw') {
-    statements.push(
-      `UPDATE ${quoteIdent(tableName)} SET ${quoteIdent(col.name)} = ${col.default.sql} WHERE ${quoteIdent(col.name)} IS NULL`
-    );
-    const rawDefaultWarning = `[kunii] DO migration: added ${tableName}.${col.name} without preserving its schema-level non-constant default; existing rows were backfilled.`;
-    warning = warning ? `${warning} ${rawDefaultWarning}` : rawDefaultWarning;
-  }
-  return { statements, warning };
-}
-
-function applyDoAdditiveMigrations(sql: any, schema: DatabaseSchema, existingTables: Set<string>): void {
-  for (const table of schema.tables) {
-    // Table was created fresh this instantiation — skip entirely.
-    if (!existingTables.has(table.name)) continue;
-
-    let existingCols = new Set<string>();
-    try {
-      const pragmaRows = sql.exec(`PRAGMA table_info(${quoteIdent(table.name)})`)?.toArray?.() ?? [];
-      existingCols = new Set(pragmaRows.map((r: any) => String(r?.name ?? '')));
-    } catch (err: any) {
-      console.warn(`[kunii] DO migration: unable to inspect table ${table.name}: ${err?.message || String(err)}`);
-      continue;
-    }
-
-    for (const col of table.columns) {
-      if (existingCols.has(col.name)) continue;
-      const { statements, warning } = buildAddColumnSql(table.name, col);
-      if (warning) console.warn(warning);
-      try {
-        for (const statement of statements) sql.exec(statement);
-        console.log(`[kunii] DO migration: added column ${table.name}.${col.name}`);
-      } catch (err: any) {
-        console.warn(`[kunii] DO migration: failed adding column ${table.name}.${col.name}: ${err?.message || String(err)}`);
-      }
-    }
-    // Index creation is handled by buildInitialSql (CREATE INDEX IF NOT EXISTS).
-    // No duplicate work needed here.
-  }
-}
-
-/**
- * Create a SqlExecutor from DO SqlStorage (synchronous .exec() API).
- * SqlStorage.exec(query) returns a Cursor with .toArray().
- */
 function sqlStorageExecutor(storage: any): { execute: SqlExecutor } {
   const execute: SqlExecutor = async (sql: string, params?: any[]) => {
     try {

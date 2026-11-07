@@ -16,8 +16,8 @@ Kuratchi's own product goals, not from upstream parity.
 - Keep type checks focused on the generated schema DSL and Kuratchi's fluent
   API, while preserving intentional escape hatches for JSON paths, relation
   predicates, and runtime-filtered fields.
-- Keep migrations additive and explicit. Table rebuilds, destructive drops,
-  and complex schema rewrites should require deliberate user action.
+- Keep runtime migrations automatic and versioned. Use explicit rename intent,
+  verified rebuild plans, and atomic execution to preserve existing data.
 - Review public docs against the current behavior: default inserts,
   undefined-field omission, nested includes, JSON-path include filters,
   top-N writes, and migration safety warnings.
@@ -25,8 +25,8 @@ Kuratchi's own product goals, not from upstream parity.
 ## Product Direction
 
 - Improve generated relation result types for common include shapes.
-- Add a deliberate story for destructive or table-rebuild migrations, likely
-  as an explicit offline workflow rather than automatic runtime migration.
+- Extend the runtime migration specification in MIGRATIONS.md with coordinated
+  dependency rebuilds and configurable execution for large migrations.
 - Tighten observability around migrations and batch execution in Workers.
 - Keep the query API small and predictable; add new operators only when they
   remove real Cloudflare application friction.

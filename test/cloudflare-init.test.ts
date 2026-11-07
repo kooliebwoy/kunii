@@ -3,19 +3,23 @@ import { initKuniiDO, initKuniiORM, initKuratchiDO, initKuratchiORM, kunii, kuni
 import { appSchema, MockD1Database, MockSqlStorage } from './cloudflare-helpers.js';
 
 describe('Cloudflare ORM init', () => {
+  it('accepts rename hints when initializing a fresh synchronous DO database', () => {
+    expect(() => initKuniiDO(new MockSqlStorage(), {
+      name: 'rename',
+      version: 2,
+      tables: { users: { mobile: 'text renameFrom phone' } },
+    })).not.toThrow();
+  });
   it('runs D1 migrations once per binding object and binding name', async () => {
     const d1 = new MockD1Database();
     const orm = initKuniiORM({ DB: appSchema });
 
-    await orm.migrateOnce({ DB: d1 });
-    await orm.migrateOnce({ DB: d1 });
+    const first = await orm.migrateOnce({ DB: d1 });
+    expect(await orm.migrateOnce({ DB: d1 })).toEqual(first);
+    expect(first.DB).toMatchObject({ applied: true, statementsRun: 1, warnings: [] });
 
-    const migrationRecords = d1.calls.filter((call) =>
-      call.sql.startsWith('INSERT INTO _kuratchi_migrations')
-    );
-
-    expect(migrationRecords).toHaveLength(1);
     expect(d1.batches).toHaveLength(1);
+    expect(d1.batches[0][0]).toMatch(/^INSERT INTO _kuratchi_migrations/);
   });
 
   it('creates D1 clients without running migrations implicitly', async () => {
