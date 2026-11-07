@@ -1,6 +1,10 @@
 # Kunii
 
-Workers-native ORM for Cloudflare D1 and Durable Object SQLite.
+Lightweight, zero-dependency, Workers-native ORM for **Cloudflare D1** and **Durable Object SQLite**.
+
+**[Full Documentation → https://kuratchi.dev/docs/kunii](https://kuratchi.dev/docs/kunii)**
+
+---
 
 ## Install
 
@@ -8,30 +12,120 @@ Workers-native ORM for Cloudflare D1 and Durable Object SQLite.
 npm install @kuratchi/kunii
 ```
 
-## D1 usage
+---
+
+## Quick Start
+
+### 1. Define your schema
+
+Define tables, mixins, indexes, FTS5 virtual tables, JSON columns, enums, and foreign keys with a compact object DSL:
+
+```ts
+// src/schema.ts
+import type { SchemaDsl } from '@kuratchi/kunii';
+
+export const appSchema: SchemaDsl = {
+  name: 'app',
+  version: 1,
+  mixins: {
+    timestamps: {
+      created_at: 'text default now',
+      updated_at: 'text default now',
+    },
+  },
+  tables: {
+    users: {
+      id: 'integer primary key',
+      email: 'text not null unique',
+      tier: 'enum(free,pro,enterprise) default free',
+      meta: 'json',
+      '...timestamps': true,
+    },
+    todos: {
+      id: 'integer primary key',
+      userId: 'integer not null -> users.id cascade',
+      title: 'text not null',
+      done: 'boolean not null default 0',
+      '...timestamps': true,
+    },
+  },
+  indexes: {
+    todos: {
+      idx_todos_user_done: { columns: ['userId', 'done'] },
+    },
+  },
+  virtualTables: {
+    todos_fts: {
+      module: 'fts5',
+      columns: ['title'],
+      options: ["tokenize='porter unicode61'"],
+    },
+  },
+};
+```
+
+> 📖 See [Schema DSL](https://kuratchi.dev/docs/kunii/schema-dsl) for all column types (`text`, `integer`, `real`, `blob`, `json`, `boolean`, `timestamp_ms`), constraints, and normalization helpers.
+
+### 2. Connect to D1
+
+Pass your D1 binding and schema to `kunii()`. Passing the schema gives you surgical JSON path queries, automatic JSON serialization/parsing, relation loading, and insert field validation out of the box:
 
 ```ts
 import { kunii } from '@kuratchi/kunii';
 import { env } from 'cloudflare:workers';
 import { appSchema } from './schema';
 
-// Pass the schema and you get JSON path queries and insert validation
-// for free. Without a schema the ORM still works,
-// but JSON columns stay opaque.
+// Immediate binding
 const db = kunii(env.DB, appSchema);
-// or with a deferred binding: kunii(() => env.DB, appSchema)
 
-await db.todos.insert({ title: 'Hello' });
-const todos = await db.todos.orderBy({ created_at: 'desc' }).many();
+// Or lazy getter for module-level singletons (resolved at query time)
+const lazyDb = kunii(() => env.DB, appSchema);
+
+await db.todos.insert({ userId: 1, title: 'Ship Kunii' });
+const todos = await db.todos.where({ done: false }).orderBy({ created_at: 'desc' }).many();
 ```
 
-## Framework init
+### 3. Connect to Durable Object SQLite
 
-Kunii is Cloudflare-only: D1 for async request handlers and
-Durable Object SQLite for DO-local state. If your app runs on Cloudflare
-Workers through SvelteKit, Next/OpenNext, Nuxt, Astro, or Koze, use
-the framework adapter that matches where Cloudflare exposes `env`. Plain
-Workers use the top-level primitives directly.
+Inside a Durable Object, initialize synchronously in the constructor with `initKuniiDO()`:
+
+```ts
+import { DurableObject } from 'cloudflare:workers';
+import { initKuniiDO } from '@kuratchi/kunii';
+import { appSchema } from './schema';
+
+export class OrgDO extends DurableObject {
+  db;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.db = initKuniiDO(ctx.storage, appSchema);
+  }
+
+  async listTodos() {
+    return this.db.todos.orderBy({ created_at: 'desc' }).many();
+  }
+}
+```
+
+`initKuniiDO(ctx.storage, schema)` runs `CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE ADD COLUMN` migrations synchronously, attaches `transactionSync` for atomic `db.batch()` calls, and returns a schema-aware `kunii` client.
+
+---
+
+## Setup & Framework Adapters
+
+Kunii is built specifically for Cloudflare Workers. Every framework adapter runs `migrateOnce(env)` on the first request per Worker isolate and exposes schema-aware clients. Direct query clients (`kunii`, `orm.db`, and `orm.clients`) never run DDL on their own.
+
+| Environment | Import Path | Helper | Where Clients Live |
+| :--- | :--- | :--- | :--- |
+| **Plain Workers** | `@kuratchi/kunii` | `orm.migrateOnce(env)` + `orm.db(env, 'DB')` | Returned directly |
+| **Koze** | `@kuratchi/kunii/koze` | `orm.middleware({ locals: 'kunii' })` | `ctx.locals.kunii.DB` (opt-in) |
+| **SvelteKit** | `@kuratchi/kunii/sveltekit` | `orm.handle()` | `event.locals.kunii.DB` |
+| **Astro** | `@kuratchi/kunii/astro` | `orm.middleware()` | `context.locals.kunii.DB` |
+| **Nuxt (Nitro)** | `@kuratchi/kunii/nuxt` | `orm.eventHandler()` | `event.context.kunii.DB` |
+| **Next.js (OpenNext)** | `@kuratchi/kunii/next` | `orm.route(handler)` | `{ db }` handler context (`db.DB`) |
+
+### Plain Cloudflare Workers
 
 ```ts
 import { initKuniiORM } from '@kuratchi/kunii';
@@ -40,7 +134,7 @@ import { appSchema } from './schema';
 const orm = initKuniiORM({ DB: appSchema });
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request: Request, env: Env) {
     await orm.migrateOnce(env);
     const db = orm.db(env, 'DB');
     const todos = await db.todos.orderBy({ created_at: 'desc' }).many();
@@ -49,248 +143,340 @@ export default {
 };
 ```
 
-Available adapter paths:
-
-- `kunii/koze` - `orm.middleware()` for Koze middleware
-- `kunii/sveltekit` - `orm.handle()` for `src/hooks.server.ts`
-- `kunii/next` - `orm.route(handler)` for OpenNext route handlers
-- `kunii/nuxt` - `orm.eventHandler()` for Nitro middleware
-- `kunii/astro` - `orm.middleware()` for Astro middleware
-
-Every adapter runs `migrateOnce(env)` before your handler and then gives you
-schema-aware clients. Direct query clients (`kunii`, `orm.db`, and
-`orm.clients`) never run DDL by themselves.
-
-## Durable Object usage
+### Koze
 
 ```ts
-import { initKuniiDO } from '@kuratchi/kunii';
-import { DurableObject } from 'cloudflare:workers';
+// src/middleware.ts
+import { defineMiddleware } from '@kuratchi/koze';
+import { initKuniiORM } from '@kuratchi/kunii/koze';
+import { appSchema } from './server/schemas/app';
 
-export class OrgDO extends DurableObject {
-  db;
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.db = initKuniiDO(ctx.storage, appSchema);
-  }
-}
-```
+const orm = initKuniiORM({ DB: appSchema });
 
-`initKuniiDO` runs the existing synchronous DO migration path
-(`CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE ADD COLUMN`) and
-returns `kunii(ctx.storage.sql, schema)`. Pass `ctx.storage` (preferred)
-so atomic `db.batch()` can use `transactionSync`.
-
-## Schema DSL
-
-```ts
-import type { SchemaDsl } from '@kuratchi/kunii';
-
-export const appSchema: SchemaDsl = {
-  name: 'app',
-  version: 1,
-  tables: {
-    todos: {
-      id: 'integer primary key',
-      title: 'text not null',
-      done: 'integer not null default 0',
-    },
-  },
-};
-```
-
-## First-class JSON columns
-
-Mark a column `json` and the ORM compiles dotted keys to surgical SQLite JSON SQL — no manual `json_extract`, no round-trips through your Worker.
-
-```ts
-tables: {
-  events: { id: 'integer primary key', payload: 'json' },
-}
-
-// reads — `payload ->> '$.user.tier'`
-await db.events.where({ 'payload.user.tier': 'pro' }).many();
-
-// writes — `json_set(payload, '$.tier', ?)`, multi-path merges into one call
-await db.events.where({ id: 1 }).update({
-  'payload.tier': 'pro',
-  'payload.seats': 5,
+export default defineMiddleware({
+  orm: orm.middleware({ locals: 'kunii' }),
 });
-
-// large IN lists use `json_each` (single bound param, no D1 placeholder cap)
-await db.todos.whereIn('id', tenThousandIds);
 ```
 
-See [Querying](../../apps/docs/src/content/kunii/querying.md) for full coverage.
-
-## API surface
-
-There is one interface — `Table<Row>`. `db.users` *is* a query (an empty one). Every method either continues the chain (returns `Table<Row>`) or terminates it (returns `Promise<QueryResult>`). Cardinality always comes from the chain, never the verb:
+### SvelteKit (`@sveltejs/adapter-cloudflare`)
 
 ```ts
-db.users.where({ id: 1 }).first();           // one row
-db.users.where({ id: 1 }).update({ x: 1 });  // updates one row (id is unique)
-db.users.where({ tier: 'free' }).delete();   // deletes all matching rows
+// src/hooks.server.ts
+import { initKuniiORM } from '@kuratchi/kunii/sveltekit';
+import { appSchema } from '$lib/server/schemas/app';
+
+const orm = initKuniiORM({ DB: appSchema });
+
+export const handle = orm.handle(); // populates event.locals.kunii.DB
 ```
 
-`update` and `delete` require a preceding `where` to prevent accidental table-wide writes. There are no shortcuts (no `delete({ id })` or `count(where)`) — the chain is the only way to express scope, which keeps the model uniform across human and agent authors.
-
-## Filter shape
-
-`where({ ... })` reads value shape and operator object together. Most queries don't need an operator name:
+### Astro (`@astrojs/cloudflare`)
 
 ```ts
-db.users.where({ id: 1 })                          // = 1
-db.users.where({ deleted_at: null })               // IS NULL
-db.users.where({ tier: ['pro', 'enterprise'] })    // IN (...)
+// src/middleware.ts
+import { initKuniiORM } from '@kuratchi/kunii/astro';
+import { appSchema } from './schemas/app';
 
-// Operator object for everything else
-db.users.where({ age: { gte: 18, lt: 65 } })
-db.users.where({ score: { between: [50, 100] } })
-db.users.where({ email: { contains: 'cloud' } })   // auto-escapes %/_
-db.users.where({ name: { like: 'A%' } })           // raw LIKE pattern
-db.users.where({ tier: { notIn: ['banned'] } })
+const orm = initKuniiORM({ DB: appSchema });
 
-// OR
+export const onRequest = orm.middleware(); // populates context.locals.kunii.DB
+```
+
+### Nuxt (Nitro on Cloudflare)
+
+```ts
+// server/middleware/orm.ts
+import { initKuniiORM } from '@kuratchi/kunii/nuxt';
+import { appSchema } from '../schemas/app';
+
+const orm = initKuniiORM({ DB: appSchema });
+
+export default orm.eventHandler(); // populates event.context.kunii.DB
+```
+
+### Next.js (`@opennextjs/cloudflare`)
+
+```ts
+// app/api/todos/route.ts
+import { initKuniiORM } from '@kuratchi/kunii/next';
+import { appSchema } from '@/server/schemas/app';
+
+const orm = initKuniiORM({ DB: appSchema });
+
+export const GET = orm.route(async ({ db }) => {
+  const todos = await db.DB.todos.many();
+  return Response.json(todos.data);
+});
+```
+
+> 📖 See [Framework Adapters](https://kuratchi.dev/docs/kunii/framework-adapters) and [Koze Integration](https://kuratchi.dev/docs/kunii/koze-integration) for multi-database configurations and custom binding resolution.
+
+---
+
+## Querying & API Surface
+
+There is one core interface: `Table<Row>`. `db.users` *is* an empty query representing all rows. Every method either continues the chain (returns `Table<Row>`) or terminates it (returns `Promise<QueryResult<T>>` or `Promise<boolean>` for `exists()`).
+
+Cardinality always comes from the chain, never the verb:
+
+```ts
+await db.users.many();                                    // all rows
+await db.users.where({ id: 1 }).first();                  // first matching row (or undefined)
+await db.users.where({ id: 1 }).one();                    // exact single row (errors if 0 or >1)
+await db.users.where({ email: 'a@b.com' }).exists();      // boolean
+await db.users.where({ tier: 'pro' }).count();            // row count
+await db.users.where({ tier: 'pro' }).distinct('email');  // distinct values array
+
+// Writes require a preceding .where() to prevent accidental full-table mutations
+await db.users.where({ id: 1 }).update({ tier: 'pro' });  // updates matching rows
+await db.users.where({ tier: 'free' }).delete();          // deletes matching rows
+
+// Chain .limit(1) with .orderBy() to narrow a broad update/delete to one row
+await db.todos
+  .where({ done: 0 })
+  .orderBy({ created_at: 'asc' })
+  .limit(1)
+  .update({ done: 1 });
+```
+
+### Filtering (`where` & `whereAny`)
+
+`where({ ... })` reads value shapes for common predicates and accepts an operator object for everything else:
+
+```ts
+// Value-shape shortcuts
+db.users.where({ id: 1 })                          // id = 1
+db.users.where({ deleted_at: null })               // deleted_at IS NULL
+db.users.where({ tier: ['pro', 'enterprise'] })    // tier IN (SELECT value FROM json_each(?))
+
+// Operator objects
+db.users.where({ age: { gte: 18, lt: 65 } })       // age >= 18 AND age < 65
+db.users.where({ score: { between: [50, 100] } })  // score BETWEEN 50 AND 100
+db.users.where({ email: { contains: '50%' } })     // LIKE '%50\%%' ESCAPE '\' (auto-escapes % and _)
+db.users.where({ name: { like: 'Ada%' } })         // raw LIKE pattern
+db.users.where({ name: { notLike: '%bot%' } })     // raw NOT LIKE pattern
+db.users.where({ tier: { notIn: ['banned'] } })    // NOT IN via json_each
+db.users.where({ bio: { isNull: false } })         // IS NOT NULL
+
+// OR groups — entries OR together, keys inside each entry AND together
 db.users.whereAny([
   { tier: 'pro' },
   { tier: 'enterprise', age: { gte: 21 } },
 ])
+
+// Raw parameterized SQL escape hatch
+db.users.sql({ query: 'LOWER(email) = ?', params: ['ada@example.com'] })
 ```
 
-Bare strings are always equality — no auto-`LIKE` magic. Pass arrays of any size to `IN` (compiles to `json_each`, no D1 placeholder cap). Empty arrays are predictable: `{ in: [] }` matches nothing, `{ notIn: [] }` matches everything.
+- **Unbounded `IN` lists:** Both array shortcuts (`{ id: [...] }`) and `{ in: [...] }` / `{ notIn: [...] }` compile to `SELECT value FROM json_each(?)` with a single bound JSON parameter—bypassing D1's placeholder limit even with 10,000+ items.
+- **Predictable empty arrays:** `{ id: [] }` / `{ in: [] }` compiles to `WHERE 0` (matches nothing); `{ notIn: [] }` compiles to `WHERE 1` (matches everything).
+
+> 📖 See [Querying](https://kuratchi.dev/docs/kunii/querying) for the complete reference.
+
+---
+
+## First-Class JSON Columns
+
+Mark a column `'json'` in your schema and Kunii compiles dotted paths and array indexes to surgical SQLite JSON expressions—no manual `json_extract` and no hauling full blobs into your Worker just to filter or patch a field.
+
+```ts
+// Reads compile to `->>` (SQL-typed extraction)
+await db.users.where({ 'meta.profile.tier': 'pro' }).many();
+// -> SELECT * FROM users WHERE meta ->> '$.profile.tier' = ?
+
+await db.users.where({ 'meta.tags[0]': 'founder' }).orderBy({ 'meta.score': 'desc' }).many();
+await db.users.select(['id', 'meta.profile.tier']).many();
+
+// Writes compile to `json_set(...)` — multiple paths on the same column merge into one call
+await db.users.where({ id: 1 }).update({
+  'meta.tier': 'pro',
+  'meta.seats': 5,
+  'meta.flags': { beta: true }, // nested objects/arrays bind safely via json(?)
+});
+// -> UPDATE users SET meta = json_set(meta, '$.tier', ?, '$.seats', ?, '$.flags', json(?)) WHERE id = ?
+```
+
+> 📖 See [JSON Columns](https://kuratchi.dev/docs/kunii/json-columns) for details.
+
+---
 
 ## Relations
 
-Mark FKs in the schema with `'-> table.column'` and the ORM auto-derives a relation registry. From the parent's POV, the child table becomes a relation key inside `where` and `include`:
+Declare foreign keys in your schema with `'-> table.column'` and Kunii builds a relation registry for both `where()` existence/count predicates and `include()` eager loading:
 
 ```ts
-posts: { id: 'integer primary key', userId: 'integer -> users.id' }
+// Filter parents by child existence or count
+await db.users.where({ todos: { any: { done: 0 } } }).many();   // EXISTS (...)
+await db.users.where({ todos: { none: {} } }).many();           // NOT EXISTS (...)
+await db.users.where({ todos: { gte: 5 } }).many();             // (SELECT count(*) ...) >= 5
+await db.users.where({ todos: { between: [1, 10] } }).many();   // count BETWEEN 1 AND 10
 
-// Filter parents by relation existence/count
-db.users.where({ posts: { any: { published: 1 } } })   // EXISTS
-db.users.where({ posts: { none: {} } })                 // NOT EXISTS
-db.users.where({ posts: { gte: 5 } })                   // count >= 5
-
-// Filtered eager loading — same operator shape as a chain
-db.users.include({
-  posts: {
-    where: { published: 1 },
-    orderBy: { createdAt: 'desc' },
-    limit: 10,                    // top N PER PARENT (window function)
-    select: ['id', 'title'],
+// Filtered eager loading
+await db.users.include({
+  todos: {
+    where: { done: 0 },
+    orderBy: { created_at: 'desc' },
+    limit: 5,                   // top 5 PER USER via ROW_NUMBER() window function
+    select: ['id', 'title'],    // FK is automatically included to stitch rows
   },
-})
+}).many();
 ```
 
-## `returning()` / `upsert()` / `db.batch()`
+> 📖 See [Relations](https://kuratchi.dev/docs/kunii/relations) for nested predicates and custom key mappings.
+
+---
+
+## Writes, Upserts & Atomic Batches
 
 ```ts
-// Get the inserted row (including auto-id) without a follow-up SELECT.
-const { data } = await db.users.returning().insert({ email: 'a@b.com' });
+// returning() — get inserted/updated/deleted rows in one round-trip
+const { data } = await db.users.returning(['id', 'email']).insert({ email: 'ada@example.com' });
 
-// Insert-or-update in one round-trip.
+// upsert() — INSERT ... ON CONFLICT DO UPDATE / DO NOTHING
 await db.users.upsert({
-  values: { id: 1, email: 'a@b.com', tier: 'pro' },
+  values: { id: 1, email: 'ada@example.com', tier: 'pro' },
   onConflict: 'id',
-  update: 'all', // or 'ignore' / { explicit: 'set' }
+  update: 'all', // or 'ignore' | { tier: 'pro', 'meta.upgraded': true }
 });
 
-// Atomic multi-write: one HTTP round-trip on D1, transactionSync on DO.
-await db.batch(async (tx) => {
+// db.batch() — single HTTP round-trip on D1, transactionSync on Durable Objects
+const batchResult = await db.batch(async (tx) => {
   await tx.users.where({ id: 1 }).update({ tier: 'pro' });
-  await tx.audit.insert({ event: 'tier_change', userId: 1 });
+  await tx.todos.insert({ userId: 1, title: 'Onboarding complete' });
 });
 ```
 
-## Aggregates and groupBy
+> 📖 See [Writes and Transactions](https://kuratchi.dev/docs/kunii/writes-and-transactions) for details.
+
+---
+
+## Aggregates & Reporting
+
+Run scalar aggregates directly or combine object-form `select()` with `groupBy()` and `having()`:
 
 ```ts
-const total = await db.orders.where({ status: 'paid' }).sum('amount');
+const totalViews = await db.posts.where({ published: 1 }).sum('views'); // number | null
+const avgScore = await db.users.avg('meta.score');                      // JSON paths work too
 
-const topByUser = await db.posts
+const topAuthors = await db.posts
+  .where({ published: 1 })
   .select({
     userId: true,
-    total: { sum: 'views' },
-    n: { count: '*' },
+    totalViews: { sum: 'views' },
+    postCount: { count: '*' },
+    uniqueTags: { countDistinct: 'tag' },
   })
   .groupBy('userId')
-  .having({ n: { gte: 5 } })
-  .orderBy({ total: 'desc' })
+  .having({ postCount: { gte: 5 }, totalViews: { gte: 1000 } })
+  .orderBy({ totalViews: 'desc' })
   .limit(10)
   .many();
 ```
 
-## Type inference
+> 📖 See [Aggregates and Reporting](https://kuratchi.dev/docs/kunii/aggregates-and-reporting) for details.
+
+---
+
+## Type Generation (`@kuratchi/kunii/codegen`)
+
+Generate a `.d.ts` file from your `SchemaDsl` or `DatabaseSchema` for full row-type inference across chains:
 
 ```ts
 import { generateTypes } from '@kuratchi/kunii/codegen';
 import { writeFile } from 'node:fs/promises';
 import { appSchema } from './schema';
 
-await writeFile('src/db-types.d.ts', generateTypes(appSchema));
+const dts = generateTypes(appSchema, {
+  ormName: 'AppOrm',
+  jsonShapes: {
+    users: { meta: "import('./types').UserMeta" },
+  },
+});
+
+await writeFile('src/db-types.d.ts', dts);
 ```
 
-Then in your worker:
+Type your client with the generated interface:
 
 ```ts
+import { kunii } from '@kuratchi/kunii';
 import type { AppOrm } from './db-types';
+import { appSchema } from './schema';
+
 const db = kunii(env.DB, appSchema) as unknown as AppOrm;
-const u = await db.users.where({ id: 1 }).first();
-// u.data.email is `string`, u.data.name is `string | null`, etc.
+const user = await db.users.where({ id: 1 }).first();
+// user.data?.email -> string
+// user.data?.tier  -> "free" | "pro" | "enterprise" | null
 ```
 
-See [Querying](../../apps/docs/src/content/kunii/querying.md) for the full reference.
+> 📖 See [Type Generation](https://kuratchi.dev/docs/kunii/type-generation) for details.
 
-## Testing
+---
 
-Two test suites:
+## Migrations & Schema Drift Checks
 
-- **Unit (`bun run test`)** — fast (~250ms). Asserts on emitted SQL strings using a mock `SqlExecutor`. 184 tests covering the full `Table<Row>` surface.
-- **Integration (`bun run test:integration`)** — runs inside `workerd` via `@cloudflare/vitest-pool-workers`. Same suite executes against a real Cloudflare D1 binding *and* a real Durable Object `SqlStorage`. 156 tests proving the ORM's SQL is semantically correct on both backends.
+When using `initKuniiORM` (or framework adapters), Kunii automatically tracks and applies schema changes at runtime in a `_kuratchi_migrations` table.
 
-Run both with `bun run test:all`.
-
-## Auto-migration on cold start
-
-For new Cloudflare apps, prefer the framework adapter paths above. The older
-legacy Koze-specific helper remains supported and applies pending migrations on
-the first request per worker isolate:
+For custom or CI/BYO migration workflows, use `@kuratchi/kunii/migrations` directly:
 
 ```ts
-// src/middleware.ts
-import { defineMiddleware } from '@kuratchi/koze';
-import { autoMigrate } from '@kuratchi/kunii';
-import { adminSchema } from './server/schemas/admin';
+import {
+  buildInitialSql,
+  buildDiffSql,
+  diffSchemas,
+  runMigrations,
+  hasPendingMigrations,
+} from '@kuratchi/kunii/migrations';
 
-export default defineMiddleware({
-  migrate: autoMigrate({ DB: adminSchema }),
-  // ...other steps
+// Generate initial CREATE TABLE / CREATE INDEX / CREATE VIRTUAL TABLE SQL
+const initialSql = buildInitialSql(appSchema);
+
+// Diff two schemas for upgrade SQL and safety warnings
+const { sql: upgradeSql, warnings } = buildDiffSql(previousSchema, appSchema);
+
+// Or run tracked runtime migrations manually
+await runMigrations({
+  execute: (sql, params) => env.DB.prepare(sql).bind(...(params || [])).all(),
+  schema: appSchema,
+  client: env.DB,
 });
 ```
 
-If you'd rather manage migrations out-of-band (e.g. CI running `wrangler d1 migrations apply`), simply omit the `autoMigrate` step. The query client `kunii(env.DB, schema)` works the same either way - it never issues DDL.
+### Dev-mode Schema Drift Check & Legacy Helpers
 
-The package also ships `assertSchemaInSync({ DB: schema })` as an opt-in dev check that throws on schema drift. Drop it into your middleware behind an `import.meta.env.DEV` guard to catch missing migrations before they surface as `no such table` errors.
-
-## Generating migration SQL manually
-
-For BYO migration workflows, the underlying DDL helpers are exported under `kunii/migrations`:
+If you manage migrations out-of-band, you can wire `assertSchemaInSync({ DB: appSchema })` in development to fail fast if the live D1 database has drifted from your TypeScript schema:
 
 ```ts
-import { buildInitialSql, buildDiffSql, diffSchemas } from '@kuratchi/kunii/migrations';
+import { assertSchemaInSync, autoMigrate } from '@kuratchi/kunii';
 
-// First-time creation
-const sql = buildInitialSql(adminSchema);
-
-// Diff against an existing DB shape
-const diff = diffSchemas(currentSchema, adminSchema);
-const { sql: upgradeSql, warnings } = buildDiffSql(currentSchema, adminSchema);
+export default defineMiddleware({
+  // Fail fast in dev if migrations haven't been applied
+  schemaCheck: import.meta.env.DEV ? assertSchemaInSync({ DB: appSchema }) : null,
+  // Or use the standalone autoMigrate middleware helper
+  migrate: autoMigrate({ DB: appSchema }),
+});
 ```
 
-## License and use
+> 📖 See [Migrations](https://kuratchi.dev/docs/kunii/migrations) for full details.
 
-MIT licensed. You can use, copy, modify, merge, publish, distribute,
-sublicense, and sell copies of this package for personal, internal, commercial,
-or open source projects. Keep the copyright and license notice with substantial
-copies of the software. This package is provided as-is, without warranty.
+---
+
+## Testing
+
+Kunii ships with three verification suites:
+
+- **Unit (`bun run test`)** — Fast (~220ms) SQL compilation and runtime behavioral suite (217 tests across 18 test files).
+- **Typecheck (`bun run test:types`)** — Static type inference assertions (`tsc --noEmit`).
+- **Integration (`bun run test:integration`)** — Runs inside `workerd` via `@cloudflare/vitest-pool-workers` against a real Cloudflare D1 binding and a real Durable Object `SqlStorage`.
+
+Run everything with:
+
+```bash
+bun run test:all
+```
+
+---
+
+## License
+
+MIT
